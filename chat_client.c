@@ -1,97 +1,115 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <fcntl.h>      // For O_* constants
-#include <sys/stat.h>   // For mode constants
-#include <mqueue.h>     // Message Queue library
+#include <mqueue.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <pthread.h>
 
-#define SERVER_QUEUE_NAME   "/server_queue"
-#define QUEUE_PERMISSIONS   0660
-#define MAX_MESSAGES        10
-#define MAX_MSG_SIZE        256
-#define MSG_BUFFER_SIZE     (MAX_MSG_SIZE + 10)
+#define QUEUE_NAME "/chat_server_queue"
+#define MAX_SIZE 1024
 
-typedef struct {
-    char sender[32];
-    char recipient[32];
-    char message[MAX_MSG_SIZE];
-} ChatMessage;
+// Function to encrypt a file using OpenSSL
+void encrypt_and_send_file(const char *client_name, const char *recipient, const char *filename, const char *password) {
+    char encrypted_file[64];
+    snprintf(encrypted_file, sizeof(encrypted_file), "%s.enc", filename);
 
-void client(char *client_name) {
-    mqd_t mq_server, mq_client;
-    struct mq_attr attr;
-    ChatMessage message;
-    char buffer[MSG_BUFFER_SIZE];
-    char recipient[32];
-    char client_queue_name[64];
+    char encrypt_command[256];
+    snprintf(encrypt_command, sizeof(encrypt_command),
+             "openssl enc -aes-256-cbc -salt -pbkdf2 -in %s -out %s -pass pass:%s",
+             filename, encrypted_file, password);
 
-    // Message queue attributes
-    attr.mq_flags = 0;
-    attr.mq_maxmsg = MAX_MESSAGES;
-    attr.mq_msgsize = sizeof(ChatMessage);
-    attr.mq_curmsgs = 0;
+    if (system(encrypt_command) != 0) {
+        printf("Encryption failed.\n");
+        return;
+    }
 
-    // Open server queue
-    mq_server = mq_open(SERVER_QUEUE_NAME, O_WRONLY);
-    if (mq_server == (mqd_t) -1) {
-        perror("Cannot open server queue");
+    mqd_t mq = mq_open(QUEUE_NAME, O_WRONLY);
+    if (mq == -1) {
+        perror("Client cannot open message queue");
         exit(1);
     }
 
-    // Create a client queue for receiving messages
-    snprintf(client_queue_name, 64, "/%s_queue", client_name);
-    mq_client = mq_open(client_queue_name, O_CREAT | O_RDONLY, QUEUE_PERMISSIONS, &attr);
-    if (mq_client == (mqd_t) -1) {
-        perror("Cannot create client queue");
+    char buffer[MAX_SIZE];
+    snprintf(buffer, MAX_SIZE, "%s %s %s %s", client_name, recipient, encrypted_file, password);
+    mq_send(mq, buffer, strlen(buffer) + 1, 0);
+    mq_close(mq);
+}
+
+// Function to send a text message
+void send_message(const char *client_name, const char *recipient, const char *message) {
+    mqd_t mq = mq_open(QUEUE_NAME, O_WRONLY);
+    if (mq == -1) {
+        perror("Client cannot open message queue");
         exit(1);
     }
 
-    printf("Client %s is running. Type 'exit' to quit.\n", client_name);
+    char buffer[MAX_SIZE];
+    snprintf(buffer, MAX_SIZE, "%s %s %s %s", client_name, recipient, message, "");
+    mq_send(mq, buffer, strlen(buffer) + 1, 0);
+    mq_close(mq);
+}
 
-    // Separate thread for receiving messages
-    if (fork() == 0) {
-        while (1) {
-            ssize_t bytes_read = mq_receive(mq_client, (char*)&message, sizeof(ChatMessage), NULL);
-            if (bytes_read < 0) {
-                perror("Message receive error");
-                continue;
-            }
-            printf("Message from %s: %s\n", message.sender, message.message);
-        }
+// Thread to poll server for messages
+void *receive_messages(void *arg) {
+    char queue_name[32];
+    snprintf(queue_name, sizeof(queue_name), "/%s_queue", (char *)arg);
+
+    mqd_t mq = mq_open(queue_name, O_RDONLY | O_CREAT, 0644, NULL);
+    if (mq == -1) {
+        perror("Message queue open error");
+        pthread_exit(NULL);
     }
 
-    // Sending messages
+    char buffer[MAX_SIZE];
     while (1) {
-        printf("Enter recipient: ");
-        scanf("%s", recipient);
-        printf("Enter message: ");
-        scanf(" %[^\n]s", message.message);
-
-        // Prepare the message structure
-        strcpy(message.sender, client_name);
-        strcpy(message.recipient, recipient);
-
-        // Send the message to the server
-        mq_send(mq_server, (char*)&message, sizeof(ChatMessage), 0);
-
-        // Exit condition
-        if (strncmp(message.message, "exit", 4) == 0) {
-            break;
+        ssize_t bytes_read = mq_receive(mq, buffer, MAX_SIZE, NULL);
+        if (bytes_read >= 0) {
+            buffer[bytes_read] = '\0';
+            printf("Message received: %s\n", buffer);
         }
     }
-
-    // Close queues
-    mq_close(mq_client);
-    mq_unlink(client_queue_name);
-    mq_close(mq_server);
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <client_name>\n", argv[0]);
-        exit(1);
+    if (argc < 2) {
+        printf("Usage: %s <client_name>\n", argv[0]);
+        return 1;
     }
-    client(argv[1]);
+
+    char client_name[32];
+    strncpy(client_name, argv[1], sizeof(client_name) - 1);
+
+    pthread_t receive_thread;
+    pthread_create(&receive_thread, NULL, receive_messages, client_name);
+
+    while (1) {
+        int choice;
+        char recipient[32], message[256], password[32];
+
+        printf("1. Send message\n2. Send encrypted file\nChoose an option: ");
+        scanf("%d", &choice);
+
+        printf("Enter recipient name: ");
+        scanf("%s", recipient);
+
+        if (choice == 1) {
+            printf("Enter message: ");
+            scanf(" %[^\n]", message);
+            send_message(client_name, recipient, message);
+        } else if (choice == 2) {
+            printf("Enter file path: ");
+            scanf("%s", message);
+            printf("Enter password: ");
+            scanf("%s", password);
+            encrypt_and_send_file(client_name, recipient, message, password);
+        } else {
+            printf("Invalid option.\n");
+        }
+    }
+
+    pthread_join(receive_thread, NULL);
     return 0;
 }

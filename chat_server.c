@@ -1,78 +1,107 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <fcntl.h>      // For O_* constants
-#include <sys/stat.h>   // For mode constants
-#include <mqueue.h>     // Message Queue library
+#include <mqueue.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <errno.h>
 
-#define SERVER_QUEUE_NAME   "/server_queue"
-#define QUEUE_PERMISSIONS   0660
-#define MAX_MESSAGES        10
-#define MAX_MSG_SIZE        256
-#define MSG_BUFFER_SIZE     (MAX_MSG_SIZE + 10)
+#define QUEUE_NAME "/chat_server_queue"
+#define MAX_SIZE 1024
 
-typedef struct {
-    char sender[32];
-    char recipient[32];
-    char message[MAX_MSG_SIZE];
-} ChatMessage;
-
-void server() {
-    mqd_t mq_server;
-    struct mq_attr attr;
-    char buffer[MSG_BUFFER_SIZE];
-    ChatMessage received_message;
-
-    // Message queue attributes
-    attr.mq_flags = 0;
-    attr.mq_maxmsg = MAX_MESSAGES;
-    attr.mq_msgsize = sizeof(ChatMessage);
-    attr.mq_curmsgs = 0;
-
-    // Create the server queue
-    mq_server = mq_open(SERVER_QUEUE_NAME, O_CREAT | O_RDONLY, QUEUE_PERMISSIONS, &attr);
-    if (mq_server == (mqd_t) -1) {
-        perror("Server queue creation failed");
-        exit(1);
+// Function to create a folder for each client
+void create_client_folder(const char *client_name) {
+    char folder_path[64];
+    snprintf(folder_path, sizeof(folder_path), "%s_files", client_name);
+    if (mkdir(folder_path, 0750) == -1 && errno != EEXIST) {
+        perror("Error creating client folder");
     }
-    
-    printf("Server is running, waiting for messages...\n");
+}
 
-    while (1) {
-        // Receive a message from the message queue
-        ssize_t bytes_read = mq_receive(mq_server, (char*)&received_message, sizeof(ChatMessage), NULL);
-        if (bytes_read < 0) {
-            perror("Message receive error");
-            continue;
-        }
+// Function to decrypt and store files securely
+void save_encrypted_file(const char *sender, const char *recipient, const char *encrypted_filename, const char *password) {
+    create_client_folder(recipient);
 
-        printf("Received message from %s to %s: %s\n", received_message.sender, received_message.recipient, received_message.message);
+    const char *filename = strrchr(encrypted_filename, '/');
+    if (filename) filename++; else filename = encrypted_filename;
 
-        // Check if the message is to exit
-        if (strncmp(received_message.message, "exit", 4) == 0) {
-            printf("Shutting down server...\n");
-            break;
-        }
+    char destination[128];
+    snprintf(destination, sizeof(destination), "%s_files/%s.dec", recipient, filename);
 
-        // Relay message to recipient queue
-        char recipient_queue_name[64];
-        snprintf(recipient_queue_name, 64, "/%s_queue", received_message.recipient);
-        mqd_t mq_recipient = mq_open(recipient_queue_name, O_WRONLY);
-        if (mq_recipient == (mqd_t) -1) {
-            printf("Recipient %s queue not found.\n", received_message.recipient);
-        } else {
-            mq_send(mq_recipient, (char*)&received_message, sizeof(ChatMessage), 0);
-            mq_close(mq_recipient);
-        }
+    char decrypt_command[256];
+    snprintf(decrypt_command, sizeof(decrypt_command),
+             "openssl enc -aes-256-cbc -pbkdf2 -d -in %s -out %s -pass pass:%s",
+             encrypted_filename, destination, password);
+
+    if (system(decrypt_command) != 0) {
+        printf("Decryption failed\n");
+        return;
     }
 
-    // Close and delete the server queue
-    mq_close(mq_server);
-    mq_unlink(SERVER_QUEUE_NAME);
+    chmod(destination, 0600);
+    chown(destination, getuid(), getgid());
+}
+
+// Function to send message to the recipient's queue
+void send_to_recipient(const char *recipient, const char *message) {
+    char queue_name[32];
+    snprintf(queue_name, sizeof(queue_name), "/%s_queue", recipient);
+
+    mqd_t mq = mq_open(queue_name, O_WRONLY | O_CREAT, 0644, NULL);
+    if (mq == -1) {
+        perror("Cannot open recipient message queue");
+        return;
+    }
+
+    mq_send(mq, message, strlen(message) + 1, 0);
+    mq_close(mq);
+}
+
+void process_message(const char *sender, const char *recipient, const char *message, const char *password) {
+    if (strstr(message, ".enc")) {
+        save_encrypted_file(sender, recipient, message, password);
+        char notification[256];
+        snprintf(notification, sizeof(notification), "File from %s saved securely.", sender);
+        send_to_recipient(recipient, notification);
+    } else {
+        send_to_recipient(recipient, message);
+        printf("Message from %s to %s: %s\n", sender, recipient, message);
+    }
 }
 
 int main() {
-    server();
+    mqd_t mq;
+    struct mq_attr attr;
+    char buffer[MAX_SIZE];
+
+    attr.mq_flags = 0;
+    attr.mq_maxmsg = 10;
+    attr.mq_msgsize = MAX_SIZE;
+    attr.mq_curmsgs = 0;
+
+    mq = mq_open(QUEUE_NAME, O_CREAT | O_RDONLY, 0644, &attr);
+    if (mq == -1) {
+        perror("Message queue creation failed");
+        exit(1);
+    }
+
+    printf("Chat server started...\n");
+
+    while (1) {
+        ssize_t bytes_read = mq_receive(mq, buffer, MAX_SIZE, NULL);
+        if (bytes_read >= 0) {
+            buffer[bytes_read] = '\0';
+            char sender[32], recipient[32], message[256], password[32];
+            sscanf(buffer, "%s %s %s %s", sender, recipient, message, password);
+            process_message(sender, recipient, message, password);
+        } else {
+            perror("Message receive error");
+        }
+    }
+
+    mq_close(mq);
+    mq_unlink(QUEUE_NAME);
     return 0;
 }
